@@ -1,48 +1,42 @@
 /*!
- * \file tl/op/elem.h
- * \brief Define element-wise and copy-related operators for TVM TensorIR
- * Lowering.
- *
- * This header declares the Copy operator and related operator descriptors
- * such as TMADesc and TMAIm2ColDesc, as well as a Conv2DIm2Col special
- * operator.
+ * \file tl/op/copy.h
+ * \brief Copy operations and Tensor Memory Access (TMA) descriptors
  */
 
 #ifndef TVM_TL_OP_COPY_H_
 #define TVM_TL_OP_COPY_H_
 
-#include "op.h"
+#include "operator.h"
 #include "parallel.h"
 
 namespace tvm {
 namespace tl {
 using namespace tir;
 
-/*!
- * \brief Descriptor for Tensor Memory Access (TMA) copy operations.
- *
- * Contains meta-information required to perform global-to-shared memory copy
- * using Tensor Memory Accelerator (TMA) hardware instructions. It is mainly
- * used to describe the shape, strides, and data layout for both source and
- * shared memory buffers.
- */
-struct TMADesc {
-  size_t rank;                  // Tensor rank (number of dimensions)
-  int data_type;                // Data type identifier (numeric code)
-  Array<PrimExpr> global_shape; // Shape of the source tensor in global memory
-  Array<PrimExpr>
-      global_stride;           // Strides of the source tensor in global memory
-  Array<PrimExpr> smem_box;    // Block shape in shared memory
-  Array<PrimExpr> smem_stride; // Strides in shared memory layout
-  PrimExpr global_addr;        // Base address in global memory
-  int swizzle;                 // Swizzle parameter for memory layout transform
-  int interleave;              // Interleave parameter for optimization
-  int oob_fill;                // Out-of-bound fill policy
-  int l2_promotion;            // Whether to promote data to L2 cache
+/// Copy instruction types for different memory access patterns
+enum class CopyInst : uint8_t {
+  kNormal = 0,    ///< Standard memory copy (ldg/stg/cpasync)
+  kLDSM = 1,      ///< Load matrix instruction
+  kSTSM = 2,      ///< Store matrix instruction
+  kBulkLoad = 3,  ///< Tensor Memory Access load
+  kBulkStore = 4, ///< Tensor Memory Access store
+};
 
-  /*!
-   * \brief Encode descriptor fields into an argument array for runtime calls.
-   */
+/// Descriptor for Tensor Memory Access (TMA) copy operations
+struct TMADesc {
+  size_t rank;                   ///< Tensor rank (number of dimensions)
+  int data_type;                 ///< Data type identifier
+  Array<PrimExpr> global_shape;  ///< Shape in global memory
+  Array<PrimExpr> global_stride; ///< Strides in global memory
+  Array<PrimExpr> smem_box;      ///< Block shape in shared memory
+  Array<PrimExpr> smem_stride;   ///< Strides in shared memory
+  PrimExpr global_addr;          ///< Base address in global memory
+  int swizzle;                   ///< Memory layout swizzle parameter
+  int interleave;                ///< Memory interleave parameter
+  int oob_fill;                  ///< Out-of-bound fill policy
+  int l2_promotion;              ///< L2 cache promotion flag
+
+  /// Encode descriptor fields into runtime call arguments
   Array<PrimExpr> EncodeCallArgs() const;
 };
 
@@ -77,50 +71,73 @@ struct TMAIm2ColDesc {
 };
 
 /*!
- * \brief Copy operator for transferring data between buffers.
- *
- * This class implements a generic copy operator in TensorIR Lowering for
- * block-wise or element-wise data transfer, possibly optimized with
- * parallelization or TMA hardware acceleration.
+ * \brief Get TVM Op handle for Conv2DIm2Col.
  */
-class Copy : public Operator {
+
+/*!
+ * \brief Clone this Conv2DIm2Col operator.
+ *
+ * Returns a TileOperator reference that is a shallow clone of this operator.
+ */
+class CopyNode : public TileOperatorNode {
 public:
-  /*!
-   * \brief Constructor.
-   * \param args  Expression arguments for the copy.
-   * \param vmap  Buffer variable mapping.
-   */
-  Copy(Array<PrimExpr> args, BufferMap vmap);
+  Buffer src, dst;                   // Source and destination buffers
+  Array<Range> src_range, dst_range; // Ranges for each dimension in src and dst
+  IntImm coalesced_width; // Width (in elements) for coalesced memory access
+  Bool disable_tma = Bool(false); // Whether to disable TMA acceleration
+
+  mutable ParallelOp par_op_; // Optional associated parallelization operator
+
+  enum class EvictionPolicy : uint8_t {
+    kEvictNormal = 0,
+    kEvictFirst = 1,
+    kEvictLast = 2,
+  };
+
+  uint8_t eviction_policy; // Policy for cache eviction
+  static constexpr const char *_type_key = "tl.Copy";
+  TVM_DECLARE_FINAL_OBJECT_INFO(CopyNode, TileOperatorNode);
+
+  static void RegisterReflection() {
+    namespace refl = tvm::ffi::reflection;
+    refl::ObjectDef<CopyNode>()
+        .def_ro("src", &CopyNode::src)
+        .def_ro("dst", &CopyNode::dst)
+        .def_ro("src_range", &CopyNode::src_range)
+        .def_ro("dst_range", &CopyNode::dst_range)
+        .def_ro("coalesced_width", &CopyNode::coalesced_width);
+  }
+
+  bool SEqualReduce(const CopyNode *other, SEqualReducer equal) const {
+    return equal(src, other->src) && equal(dst, other->dst) &&
+           equal(src_range, other->src_range) &&
+           equal(dst_range, other->dst_range) &&
+           equal(coalesced_width, other->coalesced_width);
+  }
+
+  void SHashReduce(SHashReducer hash_reduce) const {
+    hash_reduce(src);
+    hash_reduce(dst);
+    hash_reduce(src_range);
+    hash_reduce(dst_range);
+    hash_reduce(coalesced_width);
+  }
+  static constexpr bool _type_has_method_sequal_reduce = true;
+  static constexpr bool _type_has_method_shash_reduce = true;
 
   /*!
    * \brief Lower the copy operator to a TIR statement.
    * \param T        Arguments for lowering.
    * \param analyzer Analyzer for simplification and bounds checks.
    */
-  Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const final;
+  Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
 
   /*!
    * \brief Infer buffer layouts after applying this operator.
    * \param T     Arguments for layout inference.
    * \param level Level of inference (basic or detailed).
    */
-  LayoutMap InferLayout(const LayoutInferArgs &T, InferLevel level) final;
-
-  /*!
-   * \brief Get the TVM Op handle corresponding to this Copy op.
-   */
-  static const Op &Get();
-
-  /*!
-   * \brief Copy instruction type.
-   */
-  enum class CopyInst {
-    kNormal = 0,    // utilize ldg/stg or cpasync or any buffer copy
-    kLDSM = 1,      // ldmatrix memory copy
-    kSTSM = 2,      // stmatrix memory copy
-    kBulkLoad = 3,  // utilize tma load
-    kBulkStore = 4, // utilize tma store
-  };
+  LayoutMap InferLayout(const LayoutInferArgs &T, InferLevel level) const;
 
   /*!
    * \brief Check if bulk copy is supported.
@@ -148,25 +165,8 @@ public:
   CopyInst GetCopyInst(Target target, bool disable_tma_lower) const;
 
   /*!
-   * \brief Copy constructor (deep clones ParallelOp if present).
-   */
-  Copy(const Copy &other)
-      : args_(other.args_), src(other.src), dst(other.dst),
-        src_range(other.src_range), dst_range(other.dst_range),
-        coalesced_width(other.coalesced_width), disable_tma(other.disable_tma) {
-    // Deep copy ParallelOp if it exists
-    if (other.par_op_)
-      par_op_ = std::unique_ptr<ParallelOp>(
-          static_cast<ParallelOp *>(other.par_op_->Clone().release()));
-  }
-
-  /*!
    * \brief Clone this copy operator.
    */
-  std::unique_ptr<Operator> Clone() const final {
-    return std::make_unique<Copy>(*this);
-  }
-
 protected:
   /*!
    * \brief Generate lowering for bulk/global-to-shared copy.
@@ -218,23 +218,42 @@ protected:
   PrimExpr MakePredicate(arith::Analyzer *analyzer, const Array<IterVar> &ivs,
                          Array<PrimExpr> extents, int src_dst) const;
 
-  Array<PrimExpr> args_; // Copy parameters (indices, sizes, etc.)
+  /**
+   * \brief Create a deep copy of this operator.
+   *
+   * Returns a TileOperator that is a copy of the current node, preserving all
+   * configuration (buffers, parameters, and layout-related fields).
+   * @return A TileOperator owning the cloned operator node.
+   */
 
-  Buffer src, dst;                   // Source and destination buffers
-  Array<Range> src_range, dst_range; // Ranges for each dimension in src and dst
-  IntImm coalesced_width; // Width (in elements) for coalesced memory access
-  Bool disable_tma = Bool(false); // Whether to disable TMA acceleration
+  /**
+   * \brief Constructor.
+   * \param args Expression arguments for the Conv2D im2col operator.
+   * \param vmap Buffer variable mapping.
+   */
 
-  std::unique_ptr<ParallelOp>
-      par_op_; // Optional associated parallelization operator
+  /**
+   * \brief Get the TVM Op handle corresponding to this Conv2DIm2Col operator.
+   * @return Reference to the singleton TVM Op representing this operator.
+   */
+  TileOperator Clone() const;
+};
 
-  enum class EvictionPolicy {
-    kEvictNormal = 0,
-    kEvictFirst = 1,
-    kEvictLast = 2,
-  };
+class Copy : public TileOperator {
+public:
+  TVM_DEFINE_OBJECT_REF_METHODS(Copy, TileOperator, CopyNode);
 
-  int eviction_policy; // Policy for cache eviction
+  /*!
+   * \brief Constructor.
+   * \param args  Expression arguments for the copy.
+   * \param vmap  Buffer variable mapping.
+   */
+  TVM_DLL Copy(Array<PrimExpr> args, BufferMap vmap);
+
+  /*!
+   * \brief Get the TVM Op handle corresponding to this Copy op.
+   */
+  static const Op &Get();
 };
 
 /*!
@@ -243,33 +262,8 @@ protected:
  * This operator converts input image layout into columnar format suitable
  * for matrix multiplication-based convolution lowering.
  */
-class Conv2DIm2ColOp : public Operator {
+class Conv2DIm2ColOpNode : public TileOperatorNode {
 public:
-  /*!
-   * \brief Constructor.
-   * \param args  Op arguments (convolution parameters, shapes, etc.)
-   * \param vmap  Variable buffer mapping.
-   */
-  Conv2DIm2ColOp(Array<PrimExpr> args, BufferMap vmap);
-
-  /*!
-   * \brief Lower to TIR statement.
-   */
-  Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const final;
-
-  /*!
-   * \brief Get TVM Op handle.
-   */
-  static const Op &Get();
-
-  /*!
-   * \brief Clone this operator.
-   */
-  std::unique_ptr<Operator> Clone() const final {
-    return std::make_unique<Conv2DIm2ColOp>(*this);
-  }
-
-private:
   Buffer src, dst; // Source (input feature map) and destination (im2col matrix)
   int stride;      // Stride for convolution
   int padding;     // Padding amount
@@ -278,6 +272,65 @@ private:
   int eviction_policy; // Cache eviction policy
   PrimExpr nhw_step;   // Step size in NHW dimensions
   PrimExpr c_step;     // Step size in channel dimension
+
+  static constexpr const char *_type_key = "tl.Conv2DIm2Col";
+  TVM_DECLARE_FINAL_OBJECT_INFO(Conv2DIm2ColOpNode, TileOperatorNode);
+
+  static void RegisterReflection() {
+    namespace refl = tvm::ffi::reflection;
+    refl::ObjectDef<Conv2DIm2ColOpNode>()
+        .def_ro("src", &Conv2DIm2ColOpNode::src)
+        .def_ro("dst", &Conv2DIm2ColOpNode::dst)
+        .def_ro("stride", &Conv2DIm2ColOpNode::stride)
+        .def_ro("padding", &Conv2DIm2ColOpNode::padding)
+        .def_ro("dilation", &Conv2DIm2ColOpNode::dilation)
+        .def_ro("kernel", &Conv2DIm2ColOpNode::kernel)
+        .def_ro("eviction_policy", &Conv2DIm2ColOpNode::eviction_policy);
+  }
+
+  bool SEqualReduce(const Conv2DIm2ColOpNode *other,
+                    SEqualReducer equal) const {
+    return equal(src, other->src) && equal(dst, other->dst) &&
+           equal(stride, other->stride) && equal(padding, other->padding) &&
+           equal(dilation, other->dilation) && equal(kernel, other->kernel) &&
+           equal(eviction_policy, other->eviction_policy);
+  }
+
+  void SHashReduce(SHashReducer hash_reduce) const {
+    hash_reduce(src);
+    hash_reduce(dst);
+    hash_reduce(stride);
+    hash_reduce(padding);
+    hash_reduce(dilation);
+    hash_reduce(kernel);
+    hash_reduce(eviction_policy);
+  }
+  static constexpr bool _type_has_method_sequal_reduce = true;
+  static constexpr bool _type_has_method_shash_reduce = true;
+
+  /*!
+   * \brief Lower to TIR statement.
+   */
+  Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
+
+  /*!
+   * \brief Infer layout for this operator.
+   */
+  LayoutMap InferLayout(const LayoutInferArgs &T, InferLevel level) const;
+
+  /*!
+   * \brief Get TVM Op handle.
+   */
+  static const Op &Get();
+  TileOperator Clone() const;
+};
+
+class Conv2DIm2ColOp : public TileOperator {
+public:
+  TVM_DEFINE_OBJECT_REF_METHODS(Conv2DIm2ColOp, TileOperator,
+                                Conv2DIm2ColOpNode);
+  TVM_DLL Conv2DIm2ColOp(Array<PrimExpr> args, BufferMap vmap);
+  static const Op &Get();
 };
 
 } // namespace tl
